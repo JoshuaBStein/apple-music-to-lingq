@@ -1,0 +1,48 @@
+  Setup (one-time)                                                                                                    
+                  
+  1. Install dependencies                                                                                             
+  cd /Users/joshuastein/Documents/Python/AppleMusicLyricGrabber                                                       
+  python3 -m venv venv                                         
+  source venv/bin/activate                                                                                            
+  pip install -r requirements.txt                                                                                   
+                                 
+  2. Configure the script
+                                                                                                                      
+  Open lyric_lingq.py and set the two constants at the top:                                                           
+  LINGQ_API_KEY  = "YOUR_LINGQ_API_KEY"   # https://www.lingq.com/accounts/apikey/                                    
+  LINGQ_LANGUAGE = "es"                   # change to your target language code                                       
+                                                                                                                    
+  3. Run it                                                                                                           
+  source venv/bin/activate
+  python3 lyric_lingq.py                                                                                              
+                                                                                                                    
+  A ♪ icon appears in your macOS menu bar.                                                                            
+   
+  ---                                                                                                                 
+  How to use                                                                                                        
+                                                                                                                      
+  1. Play a song in Apple Music
+  2. Click ♪ in the menu bar → Import Current Song → LingQ                                                            
+  3. macOS notifications will walk you through: fetching lyrics → importing → done                                    
+                                                                                                                      
+  The lesson lands in your LingQ library under the language you configured, private by default.                       
+                                                                                                                      
+  ---                                                                                                                 
+  Notes                                                                                                             
+
+  ┌───────────────────┬────────────────────────────────────────────────────────────────────────────────────┐
+  │       Thing       │                                       Detail                                       │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ Lyrics source     │ https://lyricsovh.docs.apiary.io/ — completely free, no key needed                 │
+  ├───────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ Best for          │ Songs with well-known titles/artists; obscure tracks may return "not found"        │          
+  ├───────────────────┼────────────────────────────────────────────────────────────────────────────────────┤          
+  │ LingQ API         │ Uses v3 /imports/ endpoint — creates a private lesson with the lyrics as body text │          
+  ├───────────────────┼────────────────────────────────────────────────────────────────────────────────────┤          
+  │ Threading         │ Import runs on a background thread so the menu bar never freezes                   │        
+  ├───────────────────┼────────────────────────────────────────────────────────────────────────────────────┤          
+  │ macOS permissions │ First run will ask to allow osascript to control Music.app — click Allow           │        
+  └───────────────────┴────────────────────────────────────────────────────────────────────────────────────┘          
+   
+  If Lyrics.ovh misses a song you can swap in the Genius API later — just replace fetch_lyrics() with a Genius search 
+  call using your client token. 
