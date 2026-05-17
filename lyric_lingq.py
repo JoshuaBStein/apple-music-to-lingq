@@ -5,6 +5,7 @@ A macOS menu bar app that grabs the currently playing Apple Music track,
 fetches its lyrics, and imports them as a lesson in your LingQ library.
 """
 
+import concurrent.futures
 import os
 import re
 import subprocess
@@ -125,19 +126,32 @@ def fetch_lyrics_genius(title: str, artist: str) -> str | None:
         return None
 
 
+_shironet_session: requests.Session | None = None
+_shironet_session_lock = threading.Lock()
+
+
+def _get_shironet_session() -> requests.Session:
+    global _shironet_session
+    with _shironet_session_lock:
+        if _shironet_session is None:
+            s = requests.Session()
+            s.headers.update({
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+            })
+            try:
+                # Visit homepage once to receive cookies that bypass bot protection
+                s.get("https://shironet.mako.co.il/", timeout=10)
+            except Exception:
+                pass
+            _shironet_session = s
+        return _shironet_session
+
+
 def fetch_lyrics_shironet(title: str, artist: str) -> str | None:
     """Scrape lyrics from Shironet — the primary Hebrew lyrics database."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
-    })
-    try:
-        # Visit homepage first — required to receive cookies that bypass bot protection
-        session.get("https://shironet.mako.co.il/", timeout=10)
-    except Exception:
-        pass
+    session = _get_shironet_session()
 
     # Try artist+title first; fall back to title alone (handles English artist names
     # that don't match Shironet's Hebrew artist index).
@@ -185,39 +199,70 @@ def fetch_lyrics_shironet(title: str, artist: str) -> str | None:
 
 
 def fetch_lyrics(title: str, artist: str) -> str | None:
-    """Try Lyrics.ovh first (cleaned title), then fall back to Genius."""
+    """Fetch lyrics from all sources concurrently; return first successful result."""
     clean = clean_title(title)
     if clean != title:
         print(f"[Lyrics] Cleaned title: {title!r} → {clean!r}")
 
-    # 1. Lyrics.ovh with cleaned title
-    lyrics = fetch_lyrics_ovh(clean, artist)
-    if lyrics:
-        print(f"[Lyrics] Got {len(lyrics)} chars from Lyrics.ovh")
-        return lyrics
-
-    # 2. Genius fallback
+    sources = [
+        ("Lyrics.ovh", lambda: fetch_lyrics_ovh(clean, artist)),
+        ("Shironet",   lambda: fetch_lyrics_shironet(clean, artist)),
+    ]
     if GENIUS_API_KEY:
-        print("[Lyrics] Trying Genius fallback…")
-        lyrics = fetch_lyrics_genius(clean, artist)
-        if lyrics:
-            print(f"[Lyrics] Got {len(lyrics)} chars from Genius")
-            return lyrics
+        sources.append(("Genius", lambda: fetch_lyrics_genius(clean, artist)))
 
-    # 3. Shironet fallback (Hebrew lyrics database)
-    print("[Lyrics] Trying Shironet fallback…")
-    lyrics = fetch_lyrics_shironet(clean, artist)
-    if lyrics:
-        print(f"[Lyrics] Got {len(lyrics)} chars from Shironet")
-        return lyrics
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(sources)) as ex:
+        future_to_name = {ex.submit(fn): name for name, fn in sources}
+        for fut in concurrent.futures.as_completed(future_to_name):
+            result = fut.result()
+            if result:
+                name = future_to_name[fut]
+                print(f"[Lyrics] Got {len(result)} chars from {name}")
+                return result
 
     print("[Lyrics] All sources exhausted — no lyrics found.")
     return None
 
 
-def create_lingq_lesson(title: str, text: str) -> tuple[bool, str]:
-    """POST a new standalone lesson to LingQ via the v3 Lessons API."""
-    url = f"https://www.lingq.com/api/v3/{LINGQ_LANGUAGE}/lessons/"
+def fetch_lingq_collections() -> list[dict]:
+    """Return all of the user's LingQ collections for the current language."""
+    url = f"https://www.lingq.com/api/v3/{LINGQ_LANGUAGE}/collections/my/"
+    headers = {"Authorization": f"Token {LINGQ_API_KEY}"}
+    collections = []
+    try:
+        while url:
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            collections.extend(data.get("results", []))
+            url = data.get("next")
+    except Exception as e:
+        print(f"[LingQ] Failed to fetch collections: {e}")
+    return collections
+
+
+def create_lingq_collection(title: str) -> dict | None:
+    """Create a new LingQ collection and return its data, or None on failure."""
+    url = f"https://www.lingq.com/api/v3/{LINGQ_LANGUAGE}/collections/"
+    headers = {
+        "Authorization": f"Token {LINGQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(url, headers=headers, json={"title": title}, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[LingQ] Failed to create collection: {e}")
+        return None
+
+
+def create_lingq_lesson(title: str, text: str, collection_id: int | None = None) -> tuple[bool, str]:
+    """POST a new lesson to LingQ, optionally inside a collection."""
+    if collection_id is not None:
+        url = f"https://www.lingq.com/api/v3/{LINGQ_LANGUAGE}/collections/{collection_id}/lessons/"
+    else:
+        url = f"https://www.lingq.com/api/v3/{LINGQ_LANGUAGE}/lessons/"
     headers = {
         "Authorization": f"Token {LINGQ_API_KEY}",
         "Content-Type": "application/json",
@@ -251,12 +296,109 @@ class LyricLingQApp(rumps.App):
 
     def __init__(self):
         super().__init__("♪", quit_button="Quit")
+        self._selected_collection: dict | None = None
+        self._collections: list[dict] = []
+
+        self._coll_menu = rumps.MenuItem("Collection: None")
         self.menu = [
             rumps.MenuItem("Import Current Song → LingQ", callback=self.import_song),
             None,
-            rumps.MenuItem(f"Language: {LINGQ_LANGUAGE.upper()}", callback=None),
+            self._coll_menu,
+            rumps.MenuItem(f"Language: {LINGQ_LANGUAGE.upper()}"),
         ]
-        self.menu[f"Language: {LINGQ_LANGUAGE.upper()}"].set_callback(None)
+        self._rebuild_collection_submenu()
+        threading.Thread(target=self._load_collections, daemon=True).start()
+
+    # ── Collection submenu ────────────────────────────────────────────────────
+
+    def _collection_label(self) -> str:
+        if self._selected_collection:
+            return f"Collection: {self._selected_collection['title']}"
+        return "Collection: None"
+
+    def _load_collections(self):
+        print("[LingQ] Loading collections…")
+        self._collections = fetch_lingq_collections()
+        print(f"[LingQ] Loaded {len(self._collections)} collection(s).")
+        self._rebuild_collection_submenu()
+
+    def _rebuild_collection_submenu(self):
+        if self._coll_menu._menu is not None:
+            self._coll_menu.clear()
+
+        self._coll_menu.title = self._collection_label()
+
+        no_coll = rumps.MenuItem("No Collection (default)", callback=self._select_no_collection)
+        no_coll.state = self._selected_collection is None
+        self._coll_menu.add(no_coll)
+
+        if self._collections:
+            self._coll_menu.add(None)
+            for coll in self._collections:
+                item = rumps.MenuItem(
+                    coll["title"],
+                    callback=self._make_select_callback(coll),
+                )
+                item.state = (
+                    self._selected_collection is not None
+                    and self._selected_collection["id"] == coll["id"]
+                )
+                self._coll_menu.add(item)
+
+        self._coll_menu.add(None)
+        self._coll_menu.add(rumps.MenuItem("New Collection…", callback=self._new_collection))
+        self._coll_menu.add(rumps.MenuItem("Refresh Playlists", callback=self._refresh_collections))
+
+    def _make_select_callback(self, coll: dict):
+        def callback(_):
+            self._selected_collection = coll
+            self._rebuild_collection_submenu()
+        return callback
+
+    def _select_no_collection(self, _):
+        self._selected_collection = None
+        self._rebuild_collection_submenu()
+
+    def _new_collection(self, _):
+        window = rumps.Window(
+            message="Enter a name for the new LingQ collection:",
+            title="New Collection",
+            default_text="",
+            ok="Create",
+            cancel="Cancel",
+            dimensions=(320, 24),
+        )
+        response = window.run()
+        if response.clicked and response.text.strip():
+            threading.Thread(
+                target=self._do_create_collection,
+                args=(response.text.strip(),),
+                daemon=True,
+            ).start()
+
+    def _do_create_collection(self, name: str):
+        print(f"[LingQ] Creating collection: {name!r}")
+        coll = create_lingq_collection(name)
+        if coll:
+            self._collections.append(coll)
+            self._selected_collection = coll
+            self._rebuild_collection_submenu()
+            rumps.notification(
+                title="LyricLingQ",
+                subtitle="Collection Created",
+                message=f'"{name}" is now selected.',
+            )
+        else:
+            rumps.notification(
+                title="LyricLingQ",
+                subtitle="Failed to Create Collection",
+                message="Check the console for details.",
+            )
+
+    def _refresh_collections(self, _):
+        threading.Thread(target=self._load_collections, daemon=True).start()
+
+    # ── Import flow ───────────────────────────────────────────────────────────
 
     def import_song(self, _):
         threading.Thread(target=self._do_import, daemon=True).start()
@@ -293,15 +435,22 @@ class LyricLingQApp(rumps.App):
             return
 
         lesson_title = f"{clean_title(title)} — {artist}"
+        collection_id = self._selected_collection["id"] if self._selected_collection else None
         print(f"[LingQ] Creating lesson: {lesson_title}")
-        success, msg = create_lingq_lesson(lesson_title, lyrics)
+        if collection_id:
+            print(f"[LingQ] Target collection: {self._selected_collection['title']} (id={collection_id})")
+        success, msg = create_lingq_lesson(lesson_title, lyrics, collection_id=collection_id)
 
         if success:
             print(f"[LingQ] Success! Ref: {msg}")
+            if self._selected_collection:
+                dest = f'"{self._selected_collection["title"]}" on LingQ'
+            else:
+                dest = f"your {LINGQ_LANGUAGE.upper()} library on LingQ"
             rumps.notification(
                 title="LyricLingQ — Imported!",
                 subtitle=lesson_title,
-                message=f'Added to your {LINGQ_LANGUAGE.upper()} library on LingQ.',
+                message=f"Added to {dest}.",
             )
         else:
             print(f"[LingQ] Failed: {msg}")
